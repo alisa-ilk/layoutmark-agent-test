@@ -1,0 +1,199 @@
+# LayoutMark code agent runner.
+#
+# Copy this file into the connected repository as .github/workflows/code-agent.yml
+# and name that file in the LayoutMark project settings.
+#
+# Repository secrets:
+#   LAYOUTMARK_MCP_CLIENT_ID      shown once in LayoutMark when the repository is connected
+#   LAYOUTMARK_MCP_CLIENT_SECRET  shown once with it; a new pair can be issued any time
+#   CLAUDE_CODE_OAUTH_TOKEN       from `claude setup-token` on a Claude subscription
+
+name: LayoutMark code agent
+run-name: LayoutMark ${{ inputs.attempt_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      work_id:
+        description: LayoutMark work id
+        required: true
+      attempt_id:
+        description: LayoutMark attempt id, passed to every LayoutMark tool
+        required: true
+      mcp_url:
+        description: LayoutMark MCP endpoint
+        required: true
+      branch:
+        description: Branch this run pushes to
+        required: true
+      base_branch:
+        description: Branch to start from when the branch does not exist yet
+        required: true
+
+concurrency:
+  group: layoutmark-${{ inputs.work_id }}
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    env:
+      MCP_URL: ${{ inputs.mcp_url }}
+      BRANCH: ${{ inputs.branch }}
+      BASE_BRANCH: ${{ inputs.base_branch }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the branch of this run
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify --quiet "origin/$BRANCH"; then
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -B "$BRANCH" "origin/$BASE_BRANCH"
+          fi
+
+      - name: Write the LayoutMark MCP configuration
+        env:
+          CLIENT_ID: ${{ secrets.LAYOUTMARK_MCP_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.LAYOUTMARK_MCP_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          token=$(curl -sSf --retry 5 --retry-delay 5 --retry-all-errors -X POST "${MCP_URL%/mcp}/token" \
+            -d grant_type=client_credentials \
+            -d client_id="$CLIENT_ID" \
+            -d client_secret="$CLIENT_SECRET" \
+            -d scope="code_agent:work:read" | jq -er .access_token)
+          echo "::add-mask::$token"
+          jq -n --arg url "$MCP_URL" --arg token "$token" \
+            '{mcpServers: {layoutmark: {type: "http", url: $url, headers: {Authorization: ("Bearer " + $token)}}}}' \
+            > "$RUNNER_TEMP/layoutmark-mcp.json"
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ github.token }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You implement one piece of design feedback from LayoutMark in this repository.
+
+            Call mcp__layoutmark__get_task with attemptId "${{ inputs.attempt_id }}". It returns the page
+            the feedback is about, the element it points at, and every instruction in the order it was
+            given. Each entry under media is a screenshot of that element: download its url with curl
+            into /tmp and look at it with the Read tool before you change anything. Implement only what
+            the feedback asks for, following the conventions of this repository, and run its own checks
+            if it has any.
+
+            The branch "${{ inputs.branch }}" is already checked out. Edit files and leave them in the
+            working tree. Do not commit, do not push, do not open a pull request and do not switch
+            branches: this workflow commits your work and tells LayoutMark what was pushed, and
+            LayoutMark opens the pull request. If the feedback needs no change, leave the tree clean and
+            say so in your final message.
+          claude_args: |
+            --mcp-config ${{ runner.temp }}/layoutmark-mcp.json
+            --allowedTools Bash,Edit,MultiEdit,Write,Read,Glob,Grep,mcp__layoutmark__get_task
+
+      - name: Collect what the agent changed
+        run: |
+          set -euo pipefail
+          git add -A
+          git diff --cached --binary > "$RUNNER_TEMP/layoutmark.patch"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: layoutmark-patch
+          path: ${{ runner.temp }}/layoutmark.patch
+          if-no-files-found: error
+
+  publish:
+    needs: implement
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    env:
+      MCP_URL: ${{ inputs.mcp_url }}
+      BRANCH: ${{ inputs.branch }}
+      BASE_BRANCH: ${{ inputs.base_branch }}
+
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.implement.result == 'success'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        if: needs.implement.result == 'success'
+        with:
+          name: layoutmark-patch
+          path: ${{ runner.temp }}
+
+      - name: Commit and push what the agent changed
+        id: push
+        if: needs.implement.result == 'success'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "layoutmark[bot]"
+          git config user.email "layoutmark@users.noreply.github.com"
+          if git rev-parse --verify --quiet "origin/$BRANCH"; then
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -B "$BRANCH" "origin/$BASE_BRANCH"
+          fi
+          if [ -s "$RUNNER_TEMP/layoutmark.patch" ]; then
+            git apply --index "$RUNNER_TEMP/layoutmark.patch"
+            git commit -m "Implement LayoutMark feedback ${{ inputs.work_id }}"
+            auth=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
+            git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" \
+              push origin "HEAD:refs/heads/$BRANCH"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Report the run to LayoutMark
+        if: always()
+        env:
+          CLIENT_ID: ${{ secrets.LAYOUTMARK_MCP_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.LAYOUTMARK_MCP_CLIENT_SECRET }}
+          ATTEMPT_ID: ${{ inputs.attempt_id }}
+          RUN_ID: ${{ github.run_id }}
+          IMPLEMENTED: ${{ needs.implement.result }}
+          PUBLISHED: ${{ job.status }}
+          HEAD_SHA: ${{ steps.push.outputs.head_sha }}
+          CHANGED: ${{ steps.push.outputs.changed }}
+        run: |
+          set -euo pipefail
+          conclusion="$IMPLEMENTED"
+          if [ "$conclusion" = success ]; then conclusion="$PUBLISHED"; fi
+          if [ "$conclusion" = skipped ]; then conclusion=failure; fi
+          origin="${MCP_URL%/mcp}"
+          token=$(curl -sSf --retry 5 --retry-delay 5 --retry-all-errors -X POST "$origin/token" \
+            -d grant_type=client_credentials \
+            -d client_id="$CLIENT_ID" \
+            -d client_secret="$CLIENT_SECRET" \
+            -d scope="code_agent:result:write" | jq -er .access_token)
+          echo "::add-mask::$token"
+          curl -sSf --retry 5 --retry-delay 5 --retry-all-errors -X POST "$origin/mcp/runs/$ATTEMPT_ID" \
+            -H "Authorization: Bearer $token" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n \
+              --argjson run_id "$RUN_ID" \
+              --arg conclusion "$conclusion" \
+              --arg branch "$BRANCH" \
+              --arg head_sha "$HEAD_SHA" \
+              --argjson changed "${CHANGED:-false}" \
+              '{run_id: $run_id, conclusion: $conclusion, branch: $branch, head_sha: $head_sha, changed: $changed}')"
